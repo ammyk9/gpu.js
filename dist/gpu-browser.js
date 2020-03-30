@@ -4,8 +4,8 @@
  *
  * GPU Accelerated JavaScript
  *
- * @version 2.8.5
- * @date Fri Mar 20 2020 08:27:36 GMT-0400 (Eastern Daylight Time)
+ * @version 2.9.1
+ * @date Tue Mar 24 2020 07:52:55 GMT-0400 (Eastern Daylight Time)
  *
  * @license MIT
  * The MIT License
@@ -6025,9 +6025,11 @@ class CPUKernel extends Kernel {
     return this._kernelString = `  const LOOP_MAX = ${ this._getLoopMaxString() };
   ${ this.injectedNative || '' }
   const _this = this;
+  ${ this._resultKernelHeader() }
   ${ this._processConstants() }
   return (${ this.argumentNames.map(argumentName => 'user_' + argumentName).join(', ') }) => {
     ${ this._prependedString.join('') }
+    ${ this._earlyThrows() }
     ${ this._processArguments() }
     ${ this.graphical ? this._graphicalKernelBody(kernelThreadString) : this._resultKernelBody(kernelThreadString) }
     ${ translatedSources.length > 0 ? translatedSources.join('\n') : '' }
@@ -6069,6 +6071,26 @@ class CPUKernel extends Kernel {
       }
     }
     return result.join('');
+  }
+
+  _earlyThrows() {
+    if (this.graphical) return '';
+    if (this.immutable) return '';
+    if (!this.pipeline) return '';
+    const arrayArguments = [];
+    for (let i = 0; i < this.argumentTypes.length; i++) {
+      if (this.argumentTypes[i] === 'Array') {
+        arrayArguments.push(this.argumentNames[i]);
+      }
+    }
+    if (arrayArguments.length === 0) return '';
+    const checks = [];
+    for (let i = 0; i < arrayArguments.length; i++) {
+      const argumentName = arrayArguments[i];
+      const checkSubKernels = this._mapSubKernels(subKernel => `user_${argumentName} === result_${subKernel.name}`).join(' || ');
+      checks.push(`user_${argumentName} === result${checkSubKernels ? ` || ${checkSubKernels}` : ''}`);
+    }
+    return `if (${checks.join(' || ')}) throw new Error('Source and destination arrays are the same.  Use immutable = true');`;
   }
 
   _processArguments() {
@@ -6156,14 +6178,28 @@ class CPUKernel extends Kernel {
     return imagesArray;
   }
 
+  _resultKernelHeader() {
+    if (this.graphical) return '';
+    if (this.immutable) return '';
+    if (!this.pipeline) return '';
+    switch (this.output.length) {
+      case 1:
+        return this._mutableKernel1DResults();
+      case 2:
+        return this._mutableKernel2DResults();
+      case 3:
+        return this._mutableKernel3DResults();
+    }
+  }
+
   _resultKernelBody(kernelString) {
     switch (this.output.length) {
       case 1:
-        return this._resultKernel1DLoop(kernelString) + this._kernelOutput();
+        return (!this.immutable && this.pipeline ? this._resultMutableKernel1DLoop(kernelString) : this._resultImmutableKernel1DLoop(kernelString)) + this._kernelOutput();
       case 2:
-        return this._resultKernel2DLoop(kernelString) + this._kernelOutput();
+        return (!this.immutable && this.pipeline ? this._resultMutableKernel2DLoop(kernelString) : this._resultImmutableKernel2DLoop(kernelString)) + this._kernelOutput();
       case 3:
-        return this._resultKernel3DLoop(kernelString) + this._kernelOutput();
+        return (!this.immutable && this.pipeline ? this._resultMutableKernel3DLoop(kernelString) : this._resultImmutableKernel3DLoop(kernelString)) + this._kernelOutput();
       default:
         throw new Error('unsupported size kernel');
     }
@@ -6204,7 +6240,7 @@ class CPUKernel extends Kernel {
     }
   }
 
-  _resultKernel1DLoop(kernelString) {
+  _resultImmutableKernel1DLoop(kernelString) {
     const constructorString = this._getKernelResultTypeConstructorString();
     return `  const outputX = _this.output[0];
     const result = new ${constructorString}(outputX);
@@ -6218,7 +6254,25 @@ class CPUKernel extends Kernel {
     }`;
   }
 
-  _resultKernel2DLoop(kernelString) {
+  _mutableKernel1DResults() {
+    const constructorString = this._getKernelResultTypeConstructorString();
+    return `  const outputX = _this.output[0];
+    const result = new ${constructorString}(outputX);
+    ${ this._mapSubKernels(subKernel => `const result_${ subKernel.name } = new ${constructorString}(outputX);\n`).join('    ') }
+    ${ this._mapSubKernels(subKernel => `let subKernelResult_${ subKernel.name };\n`).join('    ') }`;
+  }
+
+  _resultMutableKernel1DLoop(kernelString) {
+    return `  const outputX = _this.output[0];
+    for (let x = 0; x < outputX; x++) {
+      this.thread.x = x;
+      this.thread.y = 0;
+      this.thread.z = 0;
+      ${ kernelString }
+    }`;
+  }
+
+  _resultImmutableKernel2DLoop(kernelString) {
     const constructorString = this._getKernelResultTypeConstructorString();
     return `  const outputX = _this.output[0];
     const outputY = _this.output[1];
@@ -6237,15 +6291,27 @@ class CPUKernel extends Kernel {
     }`;
   }
 
-  _graphicalKernel2DLoop(kernelString) {
+  _mutableKernel2DResults() {
     const constructorString = this._getKernelResultTypeConstructorString();
     return `  const outputX = _this.output[0];
     const outputY = _this.output[1];
+    const result = new Array(outputY);
     ${ this._mapSubKernels(subKernel => `const result_${ subKernel.name } = new Array(outputY);\n`).join('    ') }
     ${ this._mapSubKernels(subKernel => `let subKernelResult_${ subKernel.name };\n`).join('    ') }
     for (let y = 0; y < outputY; y++) {
+      const resultX = result[y] = new ${constructorString}(outputX);
+      ${ this._mapSubKernels(subKernel => `const resultX_${ subKernel.name } = result_${subKernel.name}[y] = new ${constructorString}(outputX);\n`).join('') }
+    }`;
+  }
+
+  _resultMutableKernel2DLoop(kernelString) {
+    const constructorString = this._getKernelResultTypeConstructorString();
+    return `  const outputX = _this.output[0];
+    const outputY = _this.output[1];
+    for (let y = 0; y < outputY; y++) {
       this.thread.z = 0;
       this.thread.y = y;
+      const resultX = result[y];
       ${ this._mapSubKernels(subKernel => `const resultX_${ subKernel.name } = result_${subKernel.name}[y] = new ${constructorString}(outputX);\n`).join('') }
       for (let x = 0; x < outputX; x++) {
         this.thread.x = x;
@@ -6254,7 +6320,20 @@ class CPUKernel extends Kernel {
     }`;
   }
 
-  _resultKernel3DLoop(kernelString) {
+  _graphicalKernel2DLoop(kernelString) {
+    return `  const outputX = _this.output[0];
+    const outputY = _this.output[1];
+    for (let y = 0; y < outputY; y++) {
+      this.thread.z = 0;
+      this.thread.y = y;
+      for (let x = 0; x < outputX; x++) {
+        this.thread.x = x;
+        ${ kernelString }
+      }
+    }`;
+  }
+
+  _resultImmutableKernel3DLoop(kernelString) {
     const constructorString = this._getKernelResultTypeConstructorString();
     return `  const outputX = _this.output[0];
     const outputY = _this.output[1];
@@ -6270,6 +6349,42 @@ class CPUKernel extends Kernel {
         this.thread.y = y;
         const resultX = resultY[y] = new ${constructorString}(outputX);
         ${ this._mapSubKernels(subKernel => `const resultX_${ subKernel.name } = resultY_${subKernel.name}[y] = new ${constructorString}(outputX);\n`).join('        ') }
+        for (let x = 0; x < outputX; x++) {
+          this.thread.x = x;
+          ${ kernelString }
+        }
+      }
+    }`;
+  }
+
+  _mutableKernel3DResults() {
+    const constructorString = this._getKernelResultTypeConstructorString();
+    return `  const outputX = _this.output[0];
+    const outputY = _this.output[1];
+    const outputZ = _this.output[2];
+    const result = new Array(outputZ);
+    ${ this._mapSubKernels(subKernel => `const result_${ subKernel.name } = new Array(outputZ);\n`).join('    ') }
+    ${ this._mapSubKernels(subKernel => `let subKernelResult_${ subKernel.name };\n`).join('    ') }
+    for (let z = 0; z < outputZ; z++) {
+      const resultY = result[z] = new Array(outputY);
+      ${ this._mapSubKernels(subKernel => `const resultY_${ subKernel.name } = result_${subKernel.name}[z] = new Array(outputY);\n`).join('      ') }
+      for (let y = 0; y < outputY; y++) {
+        const resultX = resultY[y] = new ${constructorString}(outputX);
+        ${ this._mapSubKernels(subKernel => `const resultX_${ subKernel.name } = resultY_${subKernel.name}[y] = new ${constructorString}(outputX);\n`).join('        ') }
+      }
+    }`;
+  }
+
+  _resultMutableKernel3DLoop(kernelString) {
+    return `  const outputX = _this.output[0];
+    const outputY = _this.output[1];
+    const outputZ = _this.output[2];
+    for (let z = 0; z < outputZ; z++) {
+      this.thread.z = z;
+      const resultY = result[z];
+      for (let y = 0; y < outputY; y++) {
+        this.thread.y = y;
+        const resultX = resultY[y];
         for (let x = 0; x < outputX; x++) {
           this.thread.x = x;
           ${ kernelString }
@@ -7420,15 +7535,26 @@ class FunctionNode {
     const mathFunctions = [
       'abs',
       'acos',
+      'acosh',
       'asin',
+      'asinh',
       'atan',
       'atan2',
+      'atanh',
+      'cbrt',
       'ceil',
+      'clz32',
       'cos',
+      'cosh',
+      'expm1',
       'exp',
       'floor',
+      'fround',
+      'imul',
       'log',
       'log2',
+      'log10',
+      'log1p',
       'max',
       'min',
       'pow',
@@ -7436,9 +7562,11 @@ class FunctionNode {
       'round',
       'sign',
       'sin',
+      'sinh',
       'sqrt',
       'tan',
-      'tanh'
+      'tanh',
+      'trunc',
     ];
     return ast.type === 'CallExpression' &&
       ast.callee &&
@@ -9146,6 +9274,8 @@ class GLKernel extends Kernel {
     this.compiledFragmentShader = null;
     this.compiledVertexShader = null;
     this.switchingKernels = null;
+    this._textureSwitched = null;
+    this._mappedTextureSwitched = null;
   }
 
   checkTextureSize() {
@@ -9664,12 +9794,14 @@ class GLKernel extends Kernel {
         this.texture.delete();
       }
       this.texture = null;
-      if (this.mappedTextures) {
+      this._setupOutputTexture();
+      if (this.mappedTextures && this.mappedTextures.length > 0) {
         for (let i = 0; i < this.mappedTextures.length; i++) {
           this.mappedTextures[i].delete();
         }
+        this.mappedTextures = null;
+        this._setupSubOutputTextures();
       }
-      this.mappedTextures = null;
     } else {
       this.output = newOutput;
     }
@@ -9726,6 +9858,7 @@ class GLKernel extends Kernel {
         if (prevArg.texture._refs === 1) {
           this.texture.delete();
           this.texture = prevArg.clone();
+          this._textureSwitched = true;
         }
         prevArg.delete();
       }
@@ -9740,6 +9873,7 @@ class GLKernel extends Kernel {
             if (prevArg.texture._refs === 1) {
               mappedTexture.delete();
               mappedTextures[i] = prevArg.clone();
+              this._mappedTextureSwitched[i] = true;
             }
             prevArg.delete();
           }
@@ -9964,7 +10098,8 @@ class GLTextureFloat extends GLTexture {
     this.type = 'ArrayTexture(1)';
   }
   renderRawOutput() {
-    const { context: gl, size } = this;
+    const gl = this.context;
+    const size = this.size;
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer());
     gl.framebufferTexture2D(
       gl.FRAMEBUFFER,
@@ -10019,8 +10154,10 @@ class GLTexture extends Texture {
 
   beforeMutate() {
     if (this.texture._refs > 1) {
-      this.cloneTexture();
+      this.newTexture();
+      return true;
     }
+    return false;
   }
 
   cloneTexture() {
@@ -10029,7 +10166,6 @@ class GLTexture extends Texture {
     if (kernel.debug) {
       console.warn('cloning internal texture');
     }
-    const existingFramebuffer = gl.getParameter(gl.FRAMEBUFFER_BINDING);
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer());
     selectTexture(gl, texture);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
@@ -10039,9 +10175,21 @@ class GLTexture extends Texture {
     gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 0, 0, size[0], size[1]);
     target._refs = 1;
     this.texture = target;
-    if (existingFramebuffer) {
-      gl.bindFramebuffer(gl.FRAMEBUFFER, existingFramebuffer);
+  }
+
+  newTexture() {
+    this.texture._refs--;
+    const gl = this.context;
+    const size = this.size;
+    const kernel = this.kernel;
+    if (kernel.debug) {
+      console.warn('new internal texture');
     }
+    const target = gl.createTexture();
+    selectTexture(gl, target);
+    gl.texImage2D(gl.TEXTURE_2D, 0, this.internalFormat, size[0], size[1], 0, this.textureFormat, this.textureType, null);
+    target._refs = 1;
+    this.texture = target;
   }
 
   clear() {
@@ -10082,7 +10230,7 @@ class GLTexture extends Texture {
 }
 
 function selectTexture(gl, texture) {
-  gl.activeTexture(gl.TEXTURE31); 
+  gl.activeTexture(gl.TEXTURE15);
   gl.bindTexture(gl.TEXTURE_2D, texture);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
@@ -11030,11 +11178,86 @@ __CONSTANTS__;
 
 varying vec2 vTexCoord;
 
-vec4 round(vec4 x) {
+float acosh(float x) {
+  return log(x + sqrt(x * x - 1.0));
+}
+
+float sinh(float x) {
+  return (pow(${Math.E}, x) - pow(${Math.E}, -x)) / 2.0;
+}
+
+float asinh(float x) {
+  return log(x + sqrt(x * x + 1.0));
+}
+
+float atan2(float v1, float v2) {
+  if (v1 == 0.0 || v2 == 0.0) return 0.0;
+  return atan(v1 / v2);
+}
+
+float atanh(float x) {
+  x = (x + 1.0) / (x - 1.0);
+  if (x < 0.0) {
+    return 0.5 * log(-x);
+  }
+  return 0.5 * log(x);
+}
+
+float cbrt(float x) {
+  if (x >= 0.0) {
+    return pow(x, 1.0 / 3.0);
+  } else {
+    return -pow(x, 1.0 / 3.0);
+  }
+}
+
+float cosh(float x) {
+  return (pow(${Math.E}, x) + pow(${Math.E}, -x)) / 2.0; 
+}
+
+float expm1(float x) {
+  return pow(${Math.E}, x) - 1.0; 
+}
+
+float fround(highp float x) {
+  return x;
+}
+
+float imul(float v1, float v2) {
+  return float(int(v1) * int(v2));
+}
+
+float log10(float x) {
+  return log2(x) * (1.0 / log2(10.0));
+}
+
+float log1p(float x) {
+  return log(1.0 + x);
+}
+
+float _pow(float v1, float v2) {
+  if (v2 == 0.0) return 1.0;
+  return pow(v1, v2);
+}
+
+float tanh(float x) {
+  float e = exp(2.0 * x);
+  return (e - 1.0) / (e + 1.0);
+}
+
+float trunc(float x) {
+  if (x >= 0.0) {
+    return floor(x); 
+  } else {
+    return ceil(x);
+  }
+}
+
+vec4 _round(vec4 x) {
   return floor(x + 0.5);
 }
 
-float round(float x) {
+float _round(float x) {
   return floor(x + 0.5);
 }
 
@@ -11201,9 +11424,9 @@ float decode32(vec4 texel) {
   gte128.x = texel.b >= 128.0 ? 1.0 : 0.0;
   gte128.y = texel.a >= 128.0 ? 1.0 : 0.0;
   float exponent = 2.0 * texel.a - 127.0 + dot(gte128, MAGIC_VEC);
-  float res = exp2(round(exponent));
+  float res = exp2(_round(exponent));
   texel.b = texel.b - 128.0 * gte128.x;
-  res = dot(texel, SCALE_FACTOR) * exp2(round(exponent-23.0)) + res;
+  res = dot(texel, SCALE_FACTOR) * exp2(_round(exponent-23.0)) + res;
   res *= gte128.y * -2.0 + 1.0;
   return res;
 }
@@ -12616,8 +12839,13 @@ class WebGLFunctionNode extends FunctionNode {
       throw this.astErrorOutput(`Unhandled function, couldn't find name`, ast);
     }
 
-    if (functionName === 'atan2') {
-      functionName = 'atan';
+    switch (functionName) {
+      case 'pow':
+        functionName = '_pow';
+        break;
+      case 'round':
+        functionName = '_round';
+        break;
     }
 
     if (this.calledFunctions.indexOf(functionName) < 0) {
@@ -13589,6 +13817,8 @@ module.exports = {
 const { utils } = require('../../../utils');
 const { WebGLKernelArray } = require('./array');
 
+const sameError = `Source and destination textures are the same.  Use immutable = true and manually cleanup kernel output texture memory with texture.delete()`;
+
 class WebGLKernelValueMemoryOptimizedNumberTexture extends WebGLKernelArray {
   constructor(value, settings) {
     super(value, settings);
@@ -13626,8 +13856,21 @@ class WebGLKernelValueMemoryOptimizedNumberTexture extends WebGLKernelArray {
     }
 
     const { kernel, context: gl } = this;
-    if (kernel.pipeline && kernel.immutable) {
-      kernel.updateTextureArgumentRefs(this, inputTexture);
+    if (kernel.pipeline) {
+      if (kernel.immutable) {
+        kernel.updateTextureArgumentRefs(this, inputTexture);
+      } else {
+        if (kernel.texture.texture === inputTexture.texture) {
+          throw new Error(sameError);
+        } else if (kernel.mappedTextures) {
+          const { mappedTextures } = kernel;
+          for (let i = 0; i < mappedTextures.length; i++) {
+            if (mappedTextures[i].texture === inputTexture.texture) {
+              throw new Error(sameError);
+            }
+          }
+        }
+      }
     }
 
     gl.activeTexture(this.contextHandle);
@@ -13637,11 +13880,13 @@ class WebGLKernelValueMemoryOptimizedNumberTexture extends WebGLKernelArray {
 }
 
 module.exports = {
-  WebGLKernelValueMemoryOptimizedNumberTexture
+  WebGLKernelValueMemoryOptimizedNumberTexture,
+  sameError
 };
 },{"../../../utils":114,"./array":40}],59:[function(require,module,exports){
 const { utils } = require('../../../utils');
 const { WebGLKernelArray } = require('./array');
+const { sameError } = require('./memory-optimized-number-texture');
 
 class WebGLKernelValueNumberTexture extends WebGLKernelArray {
   constructor(value, settings) {
@@ -13682,8 +13927,21 @@ class WebGLKernelValueNumberTexture extends WebGLKernelArray {
     }
 
     const { kernel, context: gl } = this;
-    if (kernel.pipeline && kernel.immutable) {
-      kernel.updateTextureArgumentRefs(this, inputTexture);
+    if (kernel.pipeline) {
+      if (kernel.immutable) {
+        kernel.updateTextureArgumentRefs(this, inputTexture);
+      } else {
+        if (kernel.texture.texture === inputTexture.texture) {
+          throw new Error(sameError);
+        } else if (kernel.mappedTextures) {
+          const { mappedTextures } = kernel;
+          for (let i = 0; i < mappedTextures.length; i++) {
+            if (mappedTextures[i].texture === inputTexture.texture) {
+              throw new Error(sameError);
+            }
+          }
+        }
+      }
     }
 
     gl.activeTexture(this.contextHandle);
@@ -13695,7 +13953,7 @@ class WebGLKernelValueNumberTexture extends WebGLKernelArray {
 module.exports = {
   WebGLKernelValueNumberTexture
 };
-},{"../../../utils":114,"./array":40}],60:[function(require,module,exports){
+},{"../../../utils":114,"./array":40,"./memory-optimized-number-texture":58}],60:[function(require,module,exports){
 const { utils } = require('../../../utils');
 const { WebGLKernelArray } = require('./array');
 
@@ -14259,13 +14517,14 @@ class WebGLKernel extends GLKernel {
     this.onRequestSwitchKernel = null;
     this.removeIstanbulCoverage = true;
 
+    this.texture = null;
+    this.mappedTextures = null;
     this.mergeSettings(source.settings || settings);
 
     this.threadDim = null;
     this.framebuffer = null;
     this.buffer = null;
-    this.texture = null;
-    this.mappedTextures = null;
+
     this.textureCache = [];
     this.programUniformLocationCache = {};
     this.uniform1fCache = {};
@@ -14663,6 +14922,7 @@ class WebGLKernel extends GLKernel {
       this.subKernels !== null &&
       this.subKernels.length > 0
     ) {
+      this._mappedTextureSwitched = {};
       this._setupSubOutputTextures();
     }
     this.buildSignature(arguments);
@@ -14697,7 +14957,6 @@ class WebGLKernel extends GLKernel {
 
     gl.useProgram(this.program);
     gl.scissor(0, 0, texSize[0], texSize[1]);
-
     if (this.dynamicOutput) {
       this.setUniform3iv('uOutputDim', new Int32Array(this.threadDim));
       this.setUniform2iv('uTexSize', texSize);
@@ -14728,7 +14987,9 @@ class WebGLKernel extends GLKernel {
       if (this.pipeline) {
         gl.bindRenderbuffer(gl.RENDERBUFFER, null);
         gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer);
-        this._setupOutputTexture();
+        if (this.immutable) {
+          this._replaceOutputTexture();
+        }
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
         return this.immutable ? this.texture.clone() : this.texture;
       }
@@ -14739,10 +15000,14 @@ class WebGLKernel extends GLKernel {
     }
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer);
-    this._setupOutputTexture();
+    if (this.immutable) {
+      this._replaceOutputTexture();
+    }
 
     if (this.subKernels !== null) {
-      this._setupSubOutputTextures();
+      if (this.immutable) {
+        this._replaceSubOutputTextures();
+      }
       this.drawBuffers();
     }
 
@@ -14766,16 +15031,21 @@ class WebGLKernel extends GLKernel {
     }
   }
 
+  _replaceOutputTexture() {
+    if (this.texture.beforeMutate() || this._textureSwitched) {
+      const gl = this.context;
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.texture.texture, 0);
+      this._textureSwitched = false;
+    }
+  }
+
   _setupOutputTexture() {
     const gl = this.context;
+    const texSize = this.texSize;
     if (this.texture) {
-      if (this.immutable) {
-        this.texture.beforeMutate();
-      }
       gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.texture.texture, 0);
       return;
     }
-    const texSize = this.texSize;
     const texture = this.createTexture();
     gl.activeTexture(gl.TEXTURE0 + this.constantTextureCount + this.argumentTextureCount);
     gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -14802,15 +15072,22 @@ class WebGLKernel extends GLKernel {
     });
   }
 
-  _setupSubOutputTextures() {
-    const { context: gl } = this;
-    if (this.mappedTextures && this.mappedTextures.length > 0) {
-      for (let i = 0; i < this.mappedTextures.length; i++) {
-        const mappedTexture = this.mappedTextures[i];
-        if (this.immutable) {
-          mappedTexture.beforeMutate();
-        }
+  _replaceSubOutputTextures() {
+    const gl = this.context;
+    for (let i = 0; i < this.mappedTextures.length; i++) {
+      const mappedTexture = this.mappedTextures[i];
+      if (mappedTexture.beforeMutate() || this._mappedTextureSwitched[i]) {
         gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i + 1, gl.TEXTURE_2D, mappedTexture.texture, 0);
+        this._mappedTextureSwitched[i] = false;
+      }
+    }
+  }
+
+  _setupSubOutputTextures() {
+    const gl = this.context;
+    if (this.mappedTextures) {
+      for (let i = 0; i < this.subKernels.length; i++) {
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i + 1, gl.TEXTURE_2D, this.mappedTextures[i].texture, 0);
       }
       return;
     }
@@ -15578,6 +15855,49 @@ __PLUGINS__;
 __CONSTANTS__;
 
 in vec2 vTexCoord;
+
+float atan2(float v1, float v2) {
+  if (v1 == 0.0 || v2 == 0.0) return 0.0;
+  return atan(v1 / v2);
+}
+
+float cbrt(float x) {
+  if (x >= 0.0) {
+    return pow(x, 1.0 / 3.0);
+  } else {
+    return -pow(x, 1.0 / 3.0);
+  }
+}
+
+float expm1(float x) {
+  return pow(${Math.E}, x) - 1.0; 
+}
+
+float fround(highp float x) {
+  return x;
+}
+
+float imul(float v1, float v2) {
+  return float(int(v1) * int(v2));
+}
+
+float log10(float x) {
+  return log2(x) * (1.0 / log2(10.0));
+}
+
+float log1p(float x) {
+  return log(1.0 + x);
+}
+
+float _pow(float v1, float v2) {
+  if (v2 == 0.0) return 1.0;
+  return pow(v1, v2);
+}
+
+float _round(float x) {
+  return floor(x + 0.5);
+}
+
 
 const int BIT_COUNT = 32;
 int modi(int x, int y) {
@@ -17080,12 +17400,10 @@ class WebGL2Kernel extends WebGLKernel {
   _setupOutputTexture() {
     const gl = this.context;
     if (this.texture) {
-      if (this.immutable) {
-        this.texture.beforeMutate();
-      }
       gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.texture.texture, 0);
       return;
     }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer);
     const texture = gl.createTexture();
     const texSize = this.texSize;
     gl.activeTexture(gl.TEXTURE0 + this.constantTextureCount + this.argumentTextureCount);
@@ -17115,13 +17433,9 @@ class WebGL2Kernel extends WebGLKernel {
 
   _setupSubOutputTextures() {
     const gl = this.context;
-    if (this.mappedTextures && this.mappedTextures.length > 0) {
-      for (let i = 0; i < this.mappedTextures.length; i++) {
-        const mappedTexture = this.mappedTextures[i];
-        if (this.immutable) {
-          mappedTexture.beforeMutate();
-        }
-        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i + 1, gl.TEXTURE_2D, mappedTexture.texture, 0);
+    if (this.mappedTextures) {
+      for (let i = 0; i < this.subKernels.length; i++) {
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i + 1, gl.TEXTURE_2D, this.mappedTextures[i].texture, 0);
       }
       return;
     }
@@ -17718,6 +18032,9 @@ class GPU {
         tactic: _kernel.tactic,
         onRequestFallback,
         onRequestSwitchKernel,
+        texture: _kernel.texture,
+        mappedTextures: _kernel.mappedTextures,
+        drawBuffersMap: _kernel.drawBuffersMap,
       });
       newKernel.build.apply(newKernel, args);
       kernelRun.replaceKernel(newKernel);
