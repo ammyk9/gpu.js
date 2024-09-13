@@ -15,6 +15,7 @@ var Texture = require('../../core/texture');
 var fragShaderString = require('./shader-frag');
 var vertShaderString = require('./shader-vert');
 var kernelString = require('./kernel-string');
+var webGlRandom = require('./plugin/random');
 var canvases = [];
 var maxTexSizes = {};
 module.exports = function (_KernelBase) {
@@ -215,6 +216,7 @@ module.exports = function (_KernelBase) {
 			gl.attachShader(program, vertShader);
 			gl.attachShader(program, fragShader);
 			gl.linkProgram(program);
+			this.trigger('build');
 			this.framebuffer = gl.createFramebuffer();
 			this.framebuffer.width = texSize[0];
 			this.framebuffer.height = texSize[1];
@@ -293,6 +295,7 @@ module.exports = function (_KernelBase) {
 			gl.useProgram(this.program);
 			gl.scissor(0, 0, texSize[0], texSize[1]);
 
+			this.trigger('run');
 			if (!this.hardcodeConstants) {
 				var uOutputDimLoc = this.getUniformLocation('uOutputDim');
 				gl.uniform3fv(uOutputDimLoc, this.threadDim);
@@ -1002,8 +1005,14 @@ module.exports = function (_KernelBase) {
 			} else {
 				result.push('highp float kernelResult = 0.0');
 			}
-
-			return this._linesToString(result) + this.functionBuilder.getPrototypeString('kernel');
+			var kernelString = this.functionBuilder.getPrototypeString('kernel');
+			var pluginsString = '';
+			if (this.functionBuilder.rootKernel.calledFunctions.some(function (fnName) {
+				return fnName === 'random';
+			})) {
+				pluginsString += webGlRandom(this);
+			}
+			return this._linesToString(result) + pluginsString + kernelString;
 		}
 
 		/**
